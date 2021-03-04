@@ -217,6 +217,17 @@ The delpw command removes a password for a given address (keyfile).
 The newaccount command creates a new keystore-backed account. It is a convenience-method
 which can be used in lieu of an external UI.`,
 	}
+	migrateAccountCommand = cli.Command{
+		Action:    utils.MigrateFlags(migrateAccount),
+		Name:      "migrateaccount",
+		Usage:     "Migrate an account",
+		ArgsUsage: "",
+		Flags: []cli.Flag{
+			logLevelFlag,
+			keystoreFlag,
+			utils.LightKDFFlag,
+		},
+	}
 
 	gendocCommand = cli.Command{
 		Action: GenDoc,
@@ -290,6 +301,7 @@ func init() {
 		setCredentialCommand,
 		delCredentialCommand,
 		newAccountCommand,
+		migrateAccountCommand,
 		gendocCommand}
 	cli.CommandHelpTemplate = flags.CommandHelpTemplate
 	// Override the default app help template
@@ -592,6 +604,57 @@ func newAccount(c *cli.Context) error {
 		fmt.Printf("Generated account %v\n", addr.String())
 	}
 	return err
+}
+
+func migrateAccount(c *cli.Context) error {
+	if err := initialize(c); err != nil {
+		return err
+	}
+	addr := c.Args().First()
+	if !common.IsHexAddress(addr) {
+		utils.Fatalf("Invalid address specified: %s", addr)
+	}
+	address := common.HexToAddress(addr)
+
+	// Get master key
+	stretchedKey, err := readMasterKey(c, nil)
+	if err != nil {
+		utils.Fatalf(err.Error())
+	}
+	configDir := c.GlobalString(configdirFlag.Name)
+	vaultLocation := filepath.Join(configDir, common.Bytes2Hex(crypto.Keccak256([]byte("vault"), stretchedKey)[:10]))
+	pwkey := crypto.Keccak256([]byte("credentials"), stretchedKey)
+
+	// Get keystore password
+	pwStorage := storage.NewAESEncryptedStorage(filepath.Join(vaultLocation, "credentials.json"), pwkey)
+	pw, err := pwStorage.Get(address.Hex())
+	if err != nil {
+		return err
+	}
+
+	// Open keystore
+	n, p := keystore.StandardScryptN, keystore.StandardScryptP
+	if c.GlobalBool(utils.LightKDFFlag.Name) {
+		n, p = keystore.LightScryptN, keystore.LightScryptP
+	}
+	ksLocation := c.GlobalString(keystoreFlag.Name)
+	ks := keystore.NewKeyStore(ksLocation, n, p)
+
+	// Export and re-import key
+	account := accounts.Account{Address: address}
+	ksJson, err := ks.Export(account, pw, pw)
+	if err != nil {
+		return err
+	}
+	if err = ks.Delete(account, pw); err != nil {
+		return err
+	}
+	_, err = ks.Import(ksJson, pw, pw)
+	if err != nil {
+		return err
+	}
+	log.Info("Account migrated", "address", address)
+	return nil
 }
 
 func initialize(c *cli.Context) error {
