@@ -149,6 +149,16 @@ var (
 The init command generates a master seed which Clef can use to store credentials and data needed for
 the rule-engine to work.`,
 	}
+	migrateKeyCommand = cli.Command{
+		Action:    utils.MigrateFlags(migrateKey),
+		Name:      "migratekey",
+		Usage:     "Migrate the key file",
+		ArgsUsage: "",
+		Flags: []cli.Flag{
+			logLevelFlag,
+			configdirFlag,
+		},
+	}
 	attestCommand = cli.Command{
 		Action:    utils.MigrateFlags(attestFile),
 		Name:      "attest",
@@ -275,6 +285,7 @@ func init() {
 	}
 	app.Action = signer
 	app.Commands = []cli.Command{initCommand,
+		migrateKeyCommand,
 		attestCommand,
 		setCredentialCommand,
 		delCredentialCommand,
@@ -391,6 +402,91 @@ You should treat 'masterseed.json' with utmost secrecy and make a backup of it!
 `)
 	return nil
 }
+
+func migrateKey(c *cli.Context) error {
+	// Get past the legal message
+	if err := initialize(c); err != nil {
+		return err
+	}
+
+	// Ensure the master key exists
+	configDir := c.GlobalString(configdirFlag.Name)
+	if err := os.Mkdir(configDir, 0700); err != nil && !os.IsExist(err) {
+		return err
+	}
+	location := filepath.Join(configDir, "masterseed.json")
+	if _, err := os.Stat(location); err != nil {
+		return fmt.Errorf("master key %v does not exists", location)
+	}
+
+	// Decrypt existing master key
+	masterSeed, err := readMasterKey(c, nil)
+	if err != nil {
+		utils.Fatalf(err.Error())
+	}
+
+	n, p := keystore.StandardScryptN, keystore.StandardScryptP
+	if c.GlobalBool(utils.LightKDFFlag.Name) {
+		n, p = keystore.LightScryptN, keystore.LightScryptP
+	}
+	text := "The master seed of clef will be locked with a password.\nPlease specify a password. Do not forget this password!"
+	var password string
+	for {
+		password = utils.GetPassPhrase(text, true)
+		if err := core.ValidatePasswordFormat(password); err != nil {
+			fmt.Printf("invalid password: %v\n", err)
+		} else {
+			fmt.Println()
+			break
+		}
+	}
+	cipherSeed, err := encryptSeed(masterSeed, []byte(password), n, p)
+	if err != nil {
+		return fmt.Errorf("failed to encrypt master seed: %v", err)
+	}
+
+	// Make a backup of the old file
+	backup := location + ".old"
+	if err = os.Chmod(backup, 0600); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	oldCipherSeed, err := ioutil.ReadFile(location)
+	if err != nil {
+		return err
+	}
+	if err = ioutil.WriteFile(backup, oldCipherSeed, 0400); err != nil {
+		return err
+	}
+	if err = os.Chmod(backup, 0400); err != nil {
+		return err
+	}
+	fmt.Printf("The old master seed has been copied into %s\n", backup)
+
+	// Write the file and print the usual warning message
+	if err = os.Chmod(location, 0600); err != nil {
+		return err
+	}
+	if err = ioutil.WriteFile(location, cipherSeed, 0400); err != nil {
+		return err
+	}
+	if err = os.Chmod(location, 0400); err != nil {
+		return err
+	}
+	fmt.Printf("A master seed has been generated into %s\n", location)
+	fmt.Printf(`
+This is required to be able to store credentials, such as:
+* Passwords for keystores (used by rule engine)
+* Storage for JavaScript auto-signing rules
+* Hash of JavaScript rule-file
+
+You should treat 'masterseed.json' with utmost secrecy and make a backup of it!
+* The password is necessary but not enough, you need to back up the master seed too!
+* The master seed does not contain your accounts, those need to be backed up separately!
+
+`)
+	return nil
+}
+
 func attestFile(ctx *cli.Context) error {
 	if len(ctx.Args()) < 1 {
 		utils.Fatalf("This command requires an argument.")
